@@ -1,16 +1,45 @@
 
 # #imports are always on top
-import random, math
+import random, math, json
+
+
+class GameError(Exception):
+    """Base error for game-state violations."""
+
+
+class CorruptSaveError(GameError):
+    """Raised when save data cannot be trusted."""
+
+
+class StoryStateError(GameError):
+    """Raised when a story node is entered without its prerequisites."""
+
+
+class GameOver(GameError):
+    """Raised when input is requested after the hero is dead."""
+
+
+# probability contribution must stay within a 0..100 roll, whatever the
+# attribute currently holds; out-of-range attributes are clamped at the
+# state boundary instead of corrupting battle resolution.
+STAT_MIN = 0
+STAT_MAX = 99
+
+RANK_NAMES = {1: "stranger"}
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
 class Game:
-    def __init__(self, gold, xp, health,qp):
+    def __init__(self, gold, xp, health, qp):
         global gconfig
         self.gold = gold
         self.xp = xp
         self.quest = [""]
-        self.qp= qp
-        self.gem_count=0
+        self.qp = qp
+        self.gem_count = 0
         self.str = random.randrange(1, 7)
         self.res = random.randrange(1, 7)
         self.dex = gconfig.points - self.str - self.res
@@ -24,8 +53,9 @@ class Game:
         self.enemy_dmg = 0
         self.dungeon_kills = 0
         self.boss_hp = 500
-        self.rank = "stranger"
-        self.quest_points=1
+        self.rank_level = 1
+        self.rank = RANK_NAMES.get(1, "rank " + str(1))
+        self.quest_points = 1
         self.hp_drinks = 0
         self.equipped_weapon = []
         self.prev_location = ""
@@ -36,19 +66,121 @@ class Game:
         self.equipped_feet = []
         self.equipped_head = []
         self.player_status = []
-        
+        self.alive = True
+
     def __str__(self):
         return "your level is " + str(self.player_level) + "; you have " + str(self.xp) + " xp" + "\nyou have " + str(self.health) + " hp; you have " + str(self.gold) + " gold" + "\nyour current rank is " + self.rank + "\nyou have " + str(self.gem_count) + " gem/gems"
 
-                
+    @property
+    def con(self):
+        return self.res
+
+    def stats_valid(self):
+        return (all(isinstance(v, int) for v in
+                    (self.str, self.res, self.dex, self.player_level,
+                     self.unspent_points, self.gold, self.xp, self.qp,
+                     self.hp_drinks, self.gem_count, self.dungeon_kills))
+                and STAT_MIN <= self.str <= STAT_MAX
+                and STAT_MIN <= self.res <= STAT_MAX
+                and STAT_MIN <= self.dex <= STAT_MAX
+                and self.player_level >= 1
+                and self.unspent_points >= 0
+                and self.gold >= 0 and self.xp >= 0 and self.qp >= 0
+                and self.hp_drinks >= 0 and self.gem_count >= 0
+                and 0 <= self.dungeon_kills <= 12
+                and isinstance(self.key_items, list)
+                and isinstance(self.equipped_weapon, list)
+                and isinstance(self.equipped_chest, list)
+                and isinstance(self.equipped_head, list)
+                and isinstance(self.equipped_legs, list)
+                and isinstance(self.equipped_feet, list)
+                and isinstance(self.player_status, list)
+                and isinstance(self.quest, list)
+                and isinstance(self.alive, bool))
+
+    def validate(self):
+        if not self.stats_valid():
+            raise GameError("game state violates its invariants")
+        if not (0 <= self.health <= self.max_health):
+            raise GameError("health out of bounds")
+        if len(set(self.key_items)) != len(self.key_items):
+            raise GameError("duplicate key item")
+        if len(set(self.equipped_weapon)) != len(self.equipped_weapon):
+            raise GameError("duplicate equipped weapon")
+        gems = [item for item in self.key_items if item.endswith("gem")]
+        if len(gems) != self.gem_count:
+            raise GameError("gem count out of sync with inventory")
+        if not self.alive and self.health > 0:
+            raise GameError("dead hero cannot retain health")
+        return True
+
+    def recompute_max_health(self):
+        return (gconfig.default_hero_health + self.player_level * 5
+                + self.res * 10)
+
+    def refresh_max_health(self):
+        self.max_health = self.recompute_max_health()
+        self.health = clamp(self.health, 0, self.max_health)
+
+    def apply_damage(self, amount):
+        if not self.alive:
+            return
+        amount = max(0, int(amount))
+        self.health = clamp(self.health - amount, 0, self.max_health)
+        if self.health <= 0:
+            self.die()
+
+    def apply_healing(self, amount):
+        if not self.alive:
+            return 0
+        before = self.health
+        self.health = clamp(self.health + max(0, int(amount)),
+                            0, self.max_health)
+        return self.health - before
+
+    def spend_gold(self, amount):
+        amount = int(amount)
+        if amount < 0 or self.gold < amount:
+            return False
+        self.gold -= amount
+        return True
+
+    def grant_key_item(self, item):
+        if item in self.key_items:
+            return False
+        self.key_items.append(item)
+        if item.endswith("gem"):
+            self.gem_count += 1
+        return True
+
+    def equip_unique(self, slot, item):
+        collection = getattr(self, slot)
+        if item in collection:
+            return False
+        collection.append(item)
+        return True
+
+    def has_quest(self, name):
+        return name in self.quest
+
+    def accept_quest(self, name):
+        if self.has_quest(name):
+            return False
+        self.quest[0] = name
+        return True
+
     def die(self):
+        if not self.alive:
+            return
         dice_d20 = random.randrange(1, 20)
         if dice_d20 <= 18:
             print(dice_d20)
             print("you just died")
+            self.alive = False
+            self.health = 0
         else:
             print("looks like you could use some help, let me revive you")
-            self.health = game.max_health
+            self.health = self.max_health
             if self.prev_location == "":
                 self.prev_location = crossroads
             self.prev_location()
@@ -74,6 +206,129 @@ class Config:
         self.scarab_blade_atk = 200
         self.gods_bane_atk = 100000
 
+
+# Every input() in the game resolves to this module global. It is the single
+# choke point between a (possibly dead) hero and the story: once death is
+# permanent, no scene may keep accepting commands.
+_real_input = input
+
+
+def input(prompt=""):
+    try:
+        if game is not None and not game.alive:
+            raise GameOver("a dead hero cannot act")
+    except NameError:
+        pass
+    return _real_input(prompt)
+
+
+# Story-node registry. A node maps to the list of predicates that ALL have to
+# hold before the node may be entered. Saving, loading and direct scene calls
+# all go through the same table, so a chapter can never be reached by
+# tampering or by bypassing the scenes that grant its prerequisites.
+NODE_PREREQUISITES = {}
+
+
+def can_enter(scene, state=None):
+    state = state if state is not None else game
+    return all(predicate(state) for predicate in NODE_PREREQUISITES.get(scene, []))
+
+
+def require_node(scene):
+    if not can_enter(scene):
+        raise StoryStateError(scene.__name__ + " is not reachable yet")
+
+
+SAVE_FIELDS = (
+    "gold", "xp", "quest", "qp", "quest_points", "gem_count",
+    "str", "res", "dex", "player_level", "unspent_points",
+    "max_health", "health", "dungeon_kills", "boss_hp",
+    "rank_level", "hp_drinks", "equipped_weapon", "prev_location",
+    "location", "key_items", "equipped_chest", "equipped_legs",
+    "equipped_feet", "equipped_head", "player_status", "alive",
+)
+
+
+def _scene_name(scene):
+    if isinstance(scene, str):
+        return scene
+    if callable(scene):
+        return scene.__name__
+    return ""
+
+
+def save_game(path="save.json"):
+    global game
+    game.validate()
+    state = {field: getattr(game, field) for field in SAVE_FIELDS}
+    state["location"] = _scene_name(game.location)
+    state["prev_location"] = _scene_name(game.prev_location)
+    with open(path, "w") as save_file:
+        json.dump(state, save_file)
+    return state
+
+
+def _scene_by_name(name):
+    if name == "":
+        return name
+    candidate = globals().get(name)
+    if callable(candidate):
+        return candidate
+    raise CorruptSaveError("unknown story node: " + str(name))
+
+
+def new_game():
+    global gconfig, game, gstory
+    try:
+        gconfig
+    except NameError:
+        gconfig = Config()
+    game = Game(0, 1, gconfig.default_hero_health, 0)
+    game.prev_location = ""
+    game.location = "crossroads"
+    gstory = Story()
+    return game
+
+
+def load_game(path="save.json"):
+    """Strictly restore a save. Raises CorruptSaveError on any tampering."""
+    global gconfig, game
+    try:
+        gconfig
+    except NameError:
+        gconfig = Config()
+    with open(path, "r") as save_file:
+        state = json.load(save_file)
+    if not isinstance(state, dict) or not all(field in state for field in SAVE_FIELDS):
+        raise CorruptSaveError("save is missing fields")
+
+    restored = Game(0, 1, gconfig.default_hero_health, 0)
+    for field in SAVE_FIELDS:
+        setattr(restored, field, state[field])
+    restored.location = _scene_by_name(state["location"])
+    restored.prev_location = _scene_by_name(state["prev_location"])
+    restored.rank = RANK_NAMES.get(restored.rank_level,
+                                   "rank " + str(restored.rank_level))
+    if restored.max_health != restored.recompute_max_health():
+        raise CorruptSaveError("max health does not derive from attributes")
+    restored.validate()
+    if not restored.alive:
+        raise CorruptSaveError("cannot resume a dead hero")
+    if restored.location and not can_enter(restored.location, restored):
+        raise StoryStateError("save jumps ahead of its prerequisites")
+    game = restored
+    return game
+
+
+def load_or_new_game(path="save.json"):
+    """Recovery path: any unreadable/untrusted save starts a new game."""
+    try:
+        return load_game(path)
+    except (CorruptSaveError, StoryStateError, ValueError, KeyError,
+            TypeError, OSError):
+        return new_game()
+
+
 class Story:
     def __init__(self):
         self.beach_story = "You decide to walk barefoot along the clean beach. The waves lap at your feet. you can see someone standing on a dock in the distance"
@@ -98,7 +353,7 @@ def ending_cave_collapsed():
 def western_scene():
     ''' commands include north, west and (back/south)'''
     global game
-    game.location = "western scene"
+    game.location = western_scene
     print('You moved west')
     decision = input('You see a dark cave ahead of you to the north\n And a Sandy Beach to the west of you \nDo you move north, move west, or turn back?\n')
     if decision == 'north' or decision == 'n':
@@ -143,7 +398,7 @@ def dock_scene():
     elif decision == "no" or decision== "n":
         print(" you decline his offer and return to the beach")
         beach_scene()
-        game.previous_location= dock_scene
+        game.prev_location = dock_scene
     elif decision == "gold":
         game.gold += 100000000
         dock_scene()
@@ -155,6 +410,8 @@ def dock_scene():
 
     
 def beach_scene():
+    global game
+    game.location = beach_scene
     print(gstory.beach_story)
     decision = input('would you like to go back to the entrance of the dark cave or check out the sea?\n')
     if decision == 'sea':
@@ -205,7 +462,7 @@ def dungeon(location):
             attack_regular(sea_scene, 'sea scene 3', True)
         elif game.dungeon_kills == 12:
             resetDungeons()
-            game.key_items= game.key_items+ "Blue gem"
+            game.grant_key_item("Blue gem")
             print("you have gotten the blue gem as well as the scroll of power!")
             print("you read the scroll, written on it is the words 'The next stone was given to the demons by one of the former heros in exchange for near endless power.'\n")
             game.prev_location = sea_scene
@@ -270,13 +527,13 @@ def resetDungeons():
     print("you cleared the dungeon!")
     print("you got 10,000 gold as a reward")
     game.gold += 10000
-    game.gem_count +=1
     game.dungeon_kills=0
     game.qp+=1
     print("you have ", game.qp,  " questpoints\n")
     print(game)
 def severed_highlands_scene():
     global game
+    require_node(severed_highlands_scene)
     game.location = severed_highlands_scene
     print("you can either go south to the gate or east to the abyssal depths\n")
     decision = input('choose either s or e\n')
@@ -300,7 +557,8 @@ def severed_highlands_scene():
             print("error")
             severed_highlands_scene()
 def abyssal_depths_scene():
-    global game,gconfig
+    global game, gconfig
+    require_node(abyssal_depths_scene)
     game.location = abyssal_depths_scene
     if game.dungeon_kills   < 8:
         game.dungeon_kills += 1
@@ -328,7 +586,7 @@ def abyssal_depths_scene():
         attack_regular(abyssal_depths_scene, 'abyssal depths 3', True)
     elif game.dungeon_kills == 12:
         resetDungeons()
-        game.key_items= game.key_items+"Purple gem"
+        game.grant_key_item("Purple gem")
         print("you have gotten the Purple gem, you see words inscribed in the wall next to the place where you found the stone")
         print(" you read the wall it says, ' look under the tides to find where the next stone hides'\n")
         game.prev_location = abyssal_depths_scene
@@ -344,9 +602,9 @@ def broken_portal():
         
     decision = input('Would you like to accept this quest?\n')
     if decision == 'y' or decision == 'yes':
-        if game.quest[0] != "hero's quest" or game.quest[1] != "hero's quest" or game.quest[2] != "hero's quest":
+        if not game.has_quest("hero's quest"):
             print("You have accepted the hero's quest\n")
-            game.quest[0]=("hero's quest")
+            game.accept_quest("hero's quest")
             print("you have taken the quest. The spirit tells you the first gem resides where the serpant lies\n")
             game.prev_location = broken_portal
             eastern_scene()
@@ -385,6 +643,7 @@ def southern_scene():
 
 def golden_dunes_scene():
     global game
+    require_node(golden_dunes_scene)
     game.location = golden_dunes_scene
     print('''you can move either west to the desert village, north back to the southern pass, or east to the Serpent's Den''')
     decision=input('choose either west, north, east\n')
@@ -402,14 +661,15 @@ def golden_dunes_scene():
             print("you don't have a reason to enter the serpent's den (maybe you are missing a quest?)\n")
             golden_dunes_scene()
     elif decision == 'n' or decision == 'north':
-        game.prev_location == golden_dunes_scene
+        game.prev_location = golden_dunes_scene
         southern_scene()
     elif decision == 'help':
         print('please, type west, east, or north\n')
 
 
 def desert_trial():
-    global game,gconfig
+    global game, gconfig
+    require_node(desert_trial)
     game.location = desert_trial
     if game.dungeon_kills   < 8:
         game.dungeon_kills += 1
@@ -437,7 +697,7 @@ def desert_trial():
         attack_regular(desert_trial, 'desert trial 3', True)
     elif game.dungeon_kills == 12:
         resetDungeons()
-        game.key_items= game.key_items+ "Yellow gem"
+        game.grant_key_item("Yellow gem")
         print("you have gotten the Yellow gem as well as the sacred scroll!")
         print("you read the sacred scroll, written on it is the words 'The next stone can be found, way down deep under the ground.'\n")
         game.prev_location = desert_trial
@@ -455,7 +715,7 @@ def desert_village_scene():
     a hero screen, where stat points could be spent, 
     and road to exit of the village. 
     What do you like to visit?\n''')
-    if village == 'inn' or village == 'i' and game.gold >= 100:
+    if village == 'inn' and game.gold >= 100:
         villageinn()
     elif village == 'inn' and game.gold < 100:
         print("You can not afford to heal you are {} gold short".format(100 - game.gold))
@@ -483,6 +743,10 @@ def enter_desert_market():
         if (shop_choice == 'drink' or shop_choice == 'drinks'
                 or shop_choice == 'healing drink' or shop_choice == 'healing drinks'):
             amount = input('input how many drinks you would like to buy\n')
+            if not amount.isdigit():
+                print("you don't have enough money for that!")
+                enter_desert_market()
+                return
             if game.gold >= int(amount) * 50:
                 game.gold = game.gold - int(amount) * 50
                 game.hp_drinks += int(amount)
@@ -494,7 +758,7 @@ def enter_desert_market():
         elif shop_choice == 'chestplate' or shop_choice == 'desert chestplate' or shop_choice == 'the desert chestplate':
             if game.gold >= 200:
                 game.gold = game.gold - 200
-                game.equipped_chest.append("desert chestplate")
+                game.equip_unique("equipped_chest", "desert chestplate")
                 print("You bought your chestplate, equipped it and headed to the exit")
                 southern_scene()
             else:
@@ -509,6 +773,10 @@ def enter_desert_market():
         if (shop_choice == 'drink' or shop_choice == 'drinks'
                 or shop_choice == 'healing drink' or shop_choice == 'healing drinks'):
             amount = input('input how many drinks you would like to buy\n')
+            if not amount.isdigit():
+                print("you don't have enough money for that!")
+                enter_desert_market()
+                return
             if game.gold >= int(amount) * 50:
                 game.gold = game.gold - int(amount) * 50
                 game.hp_drinks += int(amount)
@@ -520,7 +788,7 @@ def enter_desert_market():
         elif shop_choice == 'chestplate' or shop_choice == 'desert chestplate' or shop_choice == 'the desert chestplate':
             if game.gold >= 200:
                 game.gold = game.gold - 200
-                game.equipped_chest.append("desert chestplate")
+                game.equip_unique("equipped_chest", "desert chestplate")
                 print("You bought your chestplate, equipped it and headed to the exit")
                 southern_scene()
             else:
@@ -529,7 +797,7 @@ def enter_desert_market():
         elif shop_choice == 'blade' or shop_choice == 'scarab blade' or shop_choice == 'a scarab blade':
             if game.gold >= gconfig.scarab_blade_price:
                 game.gold = game.gold - gconfig.scarab_blade_price
-                game.equipped_weapon.append("scarab blade")
+                game.equip_unique("equipped_weapon", "scarab blade")
                 print("You bought a Scarab Blade, equipped it and headed to the exit")
                 southern_scene()
             else:
@@ -549,7 +817,7 @@ def village_scene():
     a hero screen, where stat points could be spent, 
     and road to exit of the village. 
     What do you like to visit?\n''')
-    if village == 'inn' or village == 'i' and game.gold >= 100:
+    if village == 'inn' and game.gold >= 100:
         villageinn()
     elif village == 'inn' and game.gold < 100:
         print("You can not afford to heal you are {} gold short".format(100 - game.gold))
@@ -592,9 +860,9 @@ You have {game.unspent_points} to improve stats.
             enter_hero_screen()
         game.prev_location()
     elif decision == 'con' and game.unspent_points > 0:
-        game.con += 1
+        game.res += 1
         game.unspent_points -= 1
-        game.max_health = gconfig.default_hero_health + game.player_level * 5 + game.con * 10
+        game.max_health = gconfig.default_hero_health + game.player_level * 5 + game.res * 10
         if game.unspent_points > 0:
             enter_hero_screen()
         game.prev_location()
@@ -612,11 +880,11 @@ def enter_village_guild():
     decision = input("you have one availible quest slot which quest would you like to take 1 or 2?\n")
     if decision == '1':
         print("you chose quest 1")
-        game.quest = questlist[0]
+        game.quest = [questlist[0]]
         village_scene()
     elif decision == '2':
         print("you chose quest 2")
-        game.quest = questlist[1]
+        game.quest = [questlist[1]]
         village_scene()
 
 
@@ -632,6 +900,10 @@ Or you wanna leave?''')
     if (shop_choice == 'drink' or shop_choice == 'drinks'
             or shop_choice == 'healing drink' or shop_choice == 'healing drinks'):
         amount = input('input how many drinks you would like to buy\n')
+        if not amount.isdigit():
+            print("you don't have enough money for that!")
+            enter_village_shop()
+            return
         if game.gold >= int(amount) * gconfig.hp_drink_price:
             game.gold = game.gold - int(amount) * gconfig.hp_drink_price
             game.hp_drinks += int(amount)
@@ -643,7 +915,7 @@ Or you wanna leave?''')
     elif shop_choice == 'sword' or shop_choice == 'the sword' or shop_choice == 'the damassk steel sword':
         if game.gold >= gconfig.damask_sword_price:
             game.gold = game.gold - gconfig.damask_sword_price
-            game.equipped_weapon.append("damassk sword")
+            game.equip_unique("equipped_weapon", "damassk sword")
             print("You bought your sword, swing it over your shoulder and headed to the exit")
             village_scene()
         else:
@@ -652,7 +924,7 @@ Or you wanna leave?''')
     elif shop_choice == 'trident':
         if game.gold >= gconfig.trident_price:
             game.gold = game.gold - gconfig.trident_price
-            game.equipped_weapon.append("trident")
+            game.equip_unique("equipped_weapon", "trident")
             print("You bought your trident, swung it over your shoulder and headed to the exit")
             village_scene()
         else:
@@ -671,7 +943,7 @@ def villageinn():
         print(game.max_health)
         healamount  = game.max_health - game.health
         game.health = game.max_health
-        game.gold  -= 100
+        game.spend_gold(100)
         print("you have restored {} hp in the inn".format(healamount))
         print("Now healed you leave the village and return to the crossroads")
         village_scene()
@@ -682,10 +954,9 @@ def villageinn():
 
 def calc_enemy_dmg(enemy_base_dmg):
     global game
-    chance_to_evade = (round(gconfig.hero_chance_to_evade + game.dex * gconfig.dex_evade_bonus, 2))*100
-    chance_to_evade = chance_to_evade
+    chance_to_evade = clamp(round(gconfig.hero_chance_to_evade + game.dex * gconfig.dex_evade_bonus, 2), 0, 1) * 100
     roll_5d20 = random.randint(1, 100)
-    status_inflict = random.randint(1,50+ game.res)
+    status_inflict = random.randint(1, 50 + game.res)
     if roll_5d20 <= chance_to_evade:
         print("Your chance to evade is ", chance_to_evade, "%")
         print("You rolled ", roll_5d20, ", and thus enemy missed")
@@ -695,7 +966,7 @@ def calc_enemy_dmg(enemy_base_dmg):
 
 def get_hero_dmg():
     global game, gconfig
-    calc_player_dmg = game.player_dmg + (2 ^ game.player_level) + game.str * 5
+    calc_player_dmg = game.player_dmg + (2 ** game.player_level) + game.str * 5
     # please note, you should take in DECREMENTAL ORDER BY ATK POWER
     if 'gods_bane' in game.equipped_weapon:
         calc_player_dmg += gconfig.gods_bane_atk
@@ -708,7 +979,7 @@ def get_hero_dmg():
     elif 'trident' in game.equipped_weapon:
         calc_player_dmg += gconfig.trident_atk
         #print('your attack is improved by your trident')
-    chance_to_hit = round(gconfig.hero_chance_to_hit + game.dex * gconfig.dex_accuracy_bonus, 2)*100
+    chance_to_hit = clamp(round(gconfig.hero_chance_to_hit + game.dex * gconfig.dex_accuracy_bonus, 2), 0, 1) * 100
     roll_5d20 = random.randint(1, 100)
     if roll_5d20 > chance_to_hit:
         print("Your chance to hit is", chance_to_hit, "%")
@@ -720,7 +991,7 @@ def get_hero_dmg():
 def check_new_level():
     global game, gconfig
     bool_level_changed = False
-    while game.xp > gconfig.levels[game.player_level+1]:
+    while game.player_level < max(gconfig.levels) and game.xp > gconfig.levels[game.player_level + 1]:
         bool_level_changed = True
         game.player_level += 1
         game.unspent_points += 1
@@ -736,9 +1007,10 @@ def check_new_level():
 def check_new_rank():
     global game, gconfig
     bool_rank_changed = False
-    while game.qp > gconfig.ranks[game.rank+1]:
+    while game.rank_level < max(gconfig.ranks) and game.qp > gconfig.ranks[game.rank_level + 1]:
         bool_rank_changed = True
-        game.rank += 1
+        game.rank_level += 1
+    game.rank = RANK_NAMES.get(game.rank_level, "rank " + str(game.rank_level))
 
 # -=code for battles=-
 def attack_regular(previous_scene, location=None, trial=False):
@@ -789,25 +1061,23 @@ def attack_regular(previous_scene, location=None, trial=False):
     else:
         decision = input('fight or flee?\n')
     if decision == 'fight' or decision =='1':
-        while game.enemy_hp > 0 and game.health >= 1:
+        while game.enemy_hp > 0 and game.alive:
             enemy_dmg = calc_enemy_dmg(game.enemy_dmg)
             if enemy_dmg != 0:
-                game.health = game.health - enemy_dmg
+                game.apply_damage(enemy_dmg)
                 print('The enemy did', enemy_dmg, 'damage,', 'you have', game.health, 'health')
-            if game.health >= 1:
+            if game.alive:
                 if game.health < 25 and game.hp_drinks > 0:
                     game.hp_drinks -= 1
-                    game.health += 50
+                    game.apply_healing(gconfig.hp_drink_hpower)
                     print("you drink a hp drink vital and restored 50 health by this")
                 player_dmg = get_hero_dmg()
                 game.enemy_hp = game.enemy_hp - player_dmg
                 if player_dmg != 0:
                     if game.enemy_hp <= 0:
-                        game.enemy_hp=0
+                        game.enemy_hp = 0
                     print('You did', player_dmg, 'damage,', 'the enemy has', game.enemy_hp, 'hp\n')
-            elif game.health <= 0:
-                game.die()
-        if game.enemy_hp <= 0:
+        if game.enemy_hp <= 0 and game.alive:
             game.gold += 50
             game.xp += game.enemy_level * 3
             check_new_level()
@@ -831,40 +1101,40 @@ def bossfight(previous_scene):
     else:
         print("A Goblin King appears, he towers over you")
         print('And he has', game.boss_hp, 'hp')
-        while game.boss_hp > 0 and game.health >= 0:
+        while game.boss_hp > 0 and game.alive:
             bossdam = random.randint(20, 100)
             bossdam = calc_enemy_dmg(bossdam)
-            game.health = game.health - bossdam
+            game.apply_damage(bossdam)
             print('The enemy did', bossdam, 'damage,', 'you have', game.health, 'health')
-            if game.health < 25 and game.hp_drinks > 0:
+            if game.alive and game.health < 25 and game.hp_drinks > 0:
                 game.hp_drinks -= 1
-                game.health += 50
+                game.apply_healing(gconfig.hp_drink_hpower)
                 print("you drink a hp drink vital and restored 50 health by this")
+            if not game.alive:
+                break
             player_dmg = get_hero_dmg()
             game.boss_hp = game.boss_hp - player_dmg
             if player_dmg == 0:
                 print('You missed!\n')
             else:
-                if game.enemy_hp <= 0:
-                    game.enemy_hp = 0
-                print('You did', player_dmg, 'damage,', 'the enemy has', game.enemy_hp, 'hp\n')
-        if game.boss_hp <= 0 and game.health > 0:
+                if game.boss_hp <= 0:
+                    game.boss_hp = 0
+                print('You did', player_dmg, 'damage,', 'the enemy has', game.boss_hp, 'hp\n')
+        if game.boss_hp <= 0 and game.alive:
             game.gold += 1000
             game.xp   += 500
             check_new_level()
             print(game)
-            game.key_items.append('ancient key')
+            game.grant_key_item('ancient key')
             print("you have obtained the ancient key, maybe it opens something?")
             previous_scene()
-        if game.health <= 0:
-            game.die()
 
 
 # -=code for the inital choice=-
 def map(scene):
     global game
     map = ''
-    if game.location == "crossroads":
+    if game.location == "crossroads" or _scene_name(game.location) == "crossroads":
         map = '''The World's Map on The Crossroads Sign:
 
                       North    
@@ -874,7 +1144,7 @@ def map(scene):
                       South            
                                
           '''
-    if game.location == "eastern_scene":
+    if _scene_name(game.location) == "eastern_scene":
         map = '''The World's Map on The Crossroads Sign:
 
                      Forest   Village Graveyard
@@ -915,14 +1185,15 @@ Do you want to move west, south, north, or move east? (type commands like w or w
     elif decision == 'debug':
         gconfig.hero_chance_to_evade = 0.1
         game.hp_drinks = 20
-        game.dex = 999
-        game.res = 999
-        game.str = 999
+        game.dex = STAT_MAX
+        game.res = STAT_MAX
+        game.str = STAT_MAX
         game.equipped_weapon = ['gods_bane']
         game.equipped_chest = ['desert chestplate']
         game.equipped_head = ['developers_crown']
         game.gold = 10000
-        game.key_items=('ancient key')
+        game.key_items = ['ancient key']
+        game.refresh_max_health()
         crossroads()
     else:
         print('sorry, no such option is available\n')
@@ -933,18 +1204,18 @@ Do you want to move west, south, north, or move east? (type commands like w or w
 def randoms(enemy_location=None):
     global game
     # -=code for randomized variable=-
-    if enemy_location   == 'desert trial 2':
-        game.enemy_level = random.randint(5, 7)
-    elif enemy_location == 'desert trial 3':
-        game.enemy_level = random.randint(7, 10)
-    else:
-        game.enemy_level = random.randint(1, 5)
-    if enemy_location   == 'sea scene 2':
-        game.enemy_level = random.randint(15, 17)
-    elif enemy_location == 'sea scene 3':
-        game.enemy_level = random.randint(17, 20)
-    else:
-        game.enemy_level = random.randint(11, 15)
+    # one exclusive band per location; previously two independent if/else
+    # chains overwrote every band with the final else (levels 11-15).
+    level_bands = {
+        'desert trial 2': (5, 7),
+        'desert trial 3': (7, 10),
+        'abyssal depths 2': (11, 15),
+        'abyssal depths 3': (15, 20),
+        'sea scene 2': (15, 17),
+        'sea scene 3': (17, 20),
+    }
+    low, high = level_bands.get(enemy_location, (1, 5))
+    game.enemy_level = random.randint(low, high)
     game.enemy_dmg = random.randint(5, 10)
     game.player_dmg = random.randint(50, 100)
 def help():
@@ -962,7 +1233,7 @@ def help():
             commands = "choose a direction, your options include: north, west, north-west, south or north-east"
         elif game.location == western_scene:
             commands = "choose a direction, your options include: north, west and (back/south)"
-        elif game.location == crossroads:
+        elif _scene_name(game.location) == "crossroads":
             commands = " choose a direction, your options include: north south east or west"
         print(commands)
         help()
@@ -975,16 +1246,39 @@ def help():
             eastern_scene()
         elif game.location == western_scene:
             western_scene()
-        elif game.location == crossroads:
+        elif _scene_name(game.location) == "crossroads":
             crossroads()
     elif answer != "more" and answer !="exit":
         print(game.location)
         help()
         
+def _register_nodes():
+    NODE_PREREQUISITES.update({
+        severed_highlands_scene: [lambda s: 'ancient key' in s.key_items],
+        abyssal_depths_scene: [
+            lambda s: 'ancient key' in s.key_items,
+            lambda s: s.has_quest("hero's quest"),
+            lambda s: 'Purple gem' not in s.key_items,
+        ],
+        desert_trial: [
+            lambda s: s.has_quest("hero's quest"),
+            lambda s: 'Yellow gem' not in s.key_items,
+        ],
+        golden_dunes_scene: [
+            lambda s: 'desert chestplate' in s.equipped_chest,
+        ],
+        broken_portal: [lambda s: not s.has_quest("hero's quest")],
+    })
+
+
+_register_nodes()
+
+
 if __name__ == "__main__":
     gconfig = Config()
-    game = Game(0, 1, gconfig.default_hero_health,0)
+    game = Game(0, 1, gconfig.default_hero_health, 0)
     game.prev_location = ""
+    game.location = "crossroads"
     gstory = Story()
     questlist = ['1. slay 10 Bandits\n', '2. slay 10 undead soldiers\n']
     # #starting intro to game
