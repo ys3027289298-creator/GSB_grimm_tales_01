@@ -14,6 +14,10 @@ Python 3.6
 * then copy the code from code.py 
 * finally paste the code into a new python file and press run
 
+### Running tests
+
+* From the project directory, run `python -m unittest -v`
+
 ## Help
 
 For any further questions feel free to contact me at rcwall14@gmail.com
